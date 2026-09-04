@@ -16,8 +16,8 @@
 import asyncio
 import contextlib
 import functools
-import inspect
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -344,7 +344,7 @@ def _load_doc_module(monkeypatch, module_basename="chunk_api"):
         set((req.get("reference_metadata") or {}).get("fields") or []),
     )
 
-    def _enrich_chunks_with_document_metadata(chunks, metadata_fields=None):
+    def _enrich_chunks_with_document_metadata(chunks, metadata_fields=None, **kwargs):
         for chunk in chunks:
             doc_id = chunk.get("doc_id") or chunk.get("document_id")
             if not doc_id:

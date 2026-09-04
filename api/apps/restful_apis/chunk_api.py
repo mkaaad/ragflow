@@ -406,6 +406,9 @@ async def retrieval_test(tenant_id):
     else:
         return get_error_data_result("`highlight` should be a boolean")
     include_metadata, metadata_fields = _resolve_reference_metadata(req)
+    # Opt-in flag for attaching the full document record alongside custom
+    # metadata; read locally so the shared resolver contract stays unchanged.
+    include_document_info = bool((req.get("reference_metadata") or {}).get("include_document_info", False))
     try:
         tenant_ids = list(set([kb.tenant_id for kb in kbs]))
         e, kb = KnowledgebaseService.get_by_id(kb_ids[0])
@@ -459,7 +462,7 @@ async def retrieval_test(tenant_id):
             c.pop("vector", None)
         if include_metadata:
             logging.info("sdk.retrieval reference_metadata enabled dataset_ids=%s fields=%s chunks=%s", kb_ids, sorted(metadata_fields) if metadata_fields else None, len(ranks["chunks"]))
-            enrich_chunks_with_document_metadata(ranks["chunks"], metadata_fields)
+            enrich_chunks_with_document_metadata(ranks["chunks"], metadata_fields, include_document_info=include_document_info)
 
         key_mapping = {
             "chunk_id": "id",

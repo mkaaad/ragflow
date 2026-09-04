@@ -21,18 +21,19 @@ import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from enum import StrEnum
 from functools import wraps
 from typing import Any
 
 import click
 import httpx
-import mcp.types as types
 from mcp.server.lowlevel import Server
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
-from enum import StrEnum
+
+from mcp import types
 
 
 class LaunchMode(StrEnum):
@@ -62,7 +63,6 @@ class RAGFlowConnector:
     _REST_API_MAX_PAGE_SIZE = 100
 
     _dataset_metadata_cache: OrderedDict[str, tuple[dict, float | int]] = OrderedDict()  # "dataset_id" -> (metadata, expiry_ts)
-    _document_metadata_cache: OrderedDict[str, tuple[list[tuple[str, dict]], float | int]] = OrderedDict()  # "dataset_id" -> ([(document_id, doc_metadata)], expiry_ts)
 
     def __init__(self, base_url: str, version="v1"):
         self.base_url = base_url
@@ -115,22 +115,6 @@ class RAGFlowConnector:
         self._dataset_metadata_cache.move_to_end(dataset_id)
         if len(self._dataset_metadata_cache) > self._MAX_DATASET_CACHE:
             self._dataset_metadata_cache.popitem(last=False)
-
-    def _get_cached_document_metadata_by_dataset(self, dataset_id):
-        entry = self._document_metadata_cache.get(dataset_id)
-        if entry:
-            data_list, ts = entry
-            if self._is_cache_valid(ts):
-                self._document_metadata_cache.move_to_end(dataset_id)
-                return {doc_id: doc_meta for doc_id, doc_meta in data_list}
-            del self._document_metadata_cache[dataset_id]
-        return None
-
-    def _set_cached_document_metadata_by_dataset(self, dataset_id, doc_id_meta_list):
-        self._document_metadata_cache[dataset_id] = (doc_id_meta_list, self._get_expiry_timestamp())
-        self._document_metadata_cache.move_to_end(dataset_id)
-        if len(self._document_metadata_cache) > self._MAX_DATASET_CACHE:
-            self._document_metadata_cache.popitem(last=False)
 
     async def _fetch_datasets_page(
         self,
@@ -302,6 +286,9 @@ class RAGFlowConnector:
             "question": question,
             "dataset_ids": dataset_ids,
             "document_ids": document_ids,
+            # Ask the backend to attach per-chunk document metadata for the
+            # returned chunks in the same request (no whole-dataset paging).
+            "reference_metadata": {"include": True, "include_document_info": True},
         }
         # Send a POST request to the backend service (using requests library as an example, actual implementation may vary)
         res = await self._post("/retrieval", json=data_json, api_key=api_key)
@@ -313,12 +300,13 @@ class RAGFlowConnector:
             data = res["data"]
             chunks = []
 
-            # Cache document metadata and dataset information
-            document_cache, dataset_cache = await self._get_document_metadata_cache(dataset_ids, api_key=api_key, force_refresh=force_refresh)
+            # Lightweight dataset metadata (name/description) for display. Per-chunk
+            # document metadata is already attached server-side via reference_metadata.
+            dataset_cache = await self._get_dataset_metadata_cache(dataset_ids, api_key=api_key, force_refresh=force_refresh)
 
             # Process chunks with enhanced field mapping including per-chunk metadata
             for chunk_data in data.get("chunks", []):
-                enhanced_chunk = self._map_chunk_fields(chunk_data, dataset_cache, document_cache)
+                enhanced_chunk = self._map_chunk_fields(chunk_data, dataset_cache)
                 chunks.append(enhanced_chunk)
 
             # Build structured response (no longer need response-level document_metadata)
@@ -343,13 +331,15 @@ class RAGFlowConnector:
 
         raise Exception([types.TextContent(type="text", text=res.get("message"))])
 
-    async def _get_document_metadata_cache(self, dataset_ids, *, api_key: str, force_refresh=False):
-        """Cache document metadata for all documents in the specified datasets"""
-        document_cache = {}
+    async def _get_dataset_metadata_cache(self, dataset_ids, *, api_key: str, force_refresh=False):
+        """Cache lightweight dataset-level metadata (name/description).
+
+        One failing dataset only logs and continues; it never aborts the rest.
+        """
         dataset_cache = {}
 
-        try:
-            for dataset_id in dataset_ids:
+        for dataset_id in dataset_ids:
+            try:
                 dataset_meta = None if force_refresh else self._get_cached_dataset_metadata(dataset_id)
                 if not dataset_meta:
                     # First get dataset info for name
@@ -362,69 +352,17 @@ class RAGFlowConnector:
                             self._set_cached_dataset_metadata(dataset_id, dataset_meta)
                 if dataset_meta:
                     dataset_cache[dataset_id] = dataset_meta
+            except Exception as e:
+                logging.error(f"Problem building the dataset metadata cache for dataset {dataset_id}: {e!s}")
 
-                docs = None if force_refresh else self._get_cached_document_metadata_by_dataset(dataset_id)
-                if docs is None:
-                    page = 1
-                    page_size = 30
-                    doc_id_meta_list = []
-                    docs = {}
-                    pagination_succeeded = True
-                    while True:
-                        docs_res = await self._get(f"/datasets/{dataset_id}/documents?page={page}&page_size={page_size}", api_key=api_key)
-                        if not docs_res or docs_res.status_code != 200:
-                            pagination_succeeded = False
-                            break
-                        docs_data = docs_res.json()
-                        if docs_data.get("code") != 0:
-                            pagination_succeeded = False
-                            break
-                        page_docs = docs_data.get("data", {}).get("docs") or []
-                        for doc in page_docs:
-                            doc_id = doc.get("id")
-                            if not doc_id:
-                                continue
-                            doc_meta = {
-                                "document_id": doc_id,
-                                "name": doc.get("name", ""),
-                                "location": doc.get("location", ""),
-                                "type": doc.get("type", ""),
-                                "size": doc.get("size"),
-                                "chunk_count": doc.get("chunk_count"),
-                                "create_date": doc.get("create_date", ""),
-                                "update_date": doc.get("update_date", ""),
-                                "token_count": doc.get("token_count"),
-                                "thumbnail": doc.get("thumbnail", ""),
-                                "dataset_id": doc.get("dataset_id", dataset_id),
-                                "meta_fields": doc.get("meta_fields", {}),
-                            }
-                            doc_id_meta_list.append((doc_id, doc_meta))
-                            docs[doc_id] = doc_meta
+        return dataset_cache
 
-                        # A page smaller than page_size (including an empty one) is the
-                        # last page. This terminates empty/exhausted result sets, which
-                        # previously looped forever re-requesting the same page (#16248),
-                        # and replaces the old `total - page * page_size` check that
-                        # stopped one page early and silently dropped documents.
-                        if len(page_docs) < page_size:
-                            break
-                        page += 1
-                    if pagination_succeeded:
-                        self._set_cached_document_metadata_by_dataset(dataset_id, doc_id_meta_list)
-                    else:
-                        docs = {}
-                if docs:
-                    document_cache.update(docs)
+    def _map_chunk_fields(self, chunk_data, dataset_cache):
+        """Preserve all original API fields and add per-chunk document metadata.
 
-        except Exception as e:
-            # Gracefully handle metadata cache failures
-            logging.error(f"Problem building the document metadata cache: {str(e)}")
-            pass
-
-        return document_cache, dataset_cache
-
-    def _map_chunk_fields(self, chunk_data, dataset_cache, document_cache):
-        """Preserve all original API fields and add per-chunk document metadata"""
+        ``document_metadata`` is attached server-side by the /retrieval endpoint
+        (reference_metadata.include_document_info); pass it through unchanged.
+        """
         # Start with ALL raw data from API (preserve everything like original version)
         mapped = dict(chunk_data)
 
@@ -437,11 +375,6 @@ class RAGFlowConnector:
 
         # Add document name convenience field
         mapped["document_name"] = chunk_data.get("document_keyword", "")
-
-        # Add per-chunk document metadata
-        document_id = chunk_data.get("document_id")
-        if document_id and document_id in document_cache:
-            mapped["document_metadata"] = document_cache[document_id]
 
         return mapped
 
@@ -602,7 +535,7 @@ async def list_tools(*, connector: RAGFlowConnector, api_key: str) -> list[types
                     },
                     "force_refresh": {
                         "type": "boolean",
-                        "description": "Set to true only if fresh dataset and document metadata is explicitly required. Otherwise, cached metadata is used (default: false).",
+                        "description": "Set to true only if fresh dataset metadata is explicitly required. Otherwise, cached metadata is used (default: false). Document metadata is always returned fresh from the backend.",
                         "default": False,
                     },
                 },

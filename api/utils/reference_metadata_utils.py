@@ -68,10 +68,17 @@ def enrich_chunks_with_document_metadata(
     kb_field: str = "kb_id",
     doc_field: str = "doc_id",
     output_field: str = "document_metadata",
+    include_document_info: bool = False,
 ) -> None:
     """
     Mutates chunk payloads in-place by attaching `document_metadata`.
     Field names can be customized for different chunk schemas.
+
+    With include_document_info=True the full document record (name, location,
+    type, size, chunk_count, create_date, update_date, token_count, thumbnail,
+    dataset_id) is attached alongside the custom meta_fields. This matches the
+    shape served to the MCP retrieval tool. DB failures are fail-open: the
+    enrichment is skipped and the retrieval result is still returned unchanged.
     """
     if metadata_fields is not None and not metadata_fields:
         return
@@ -90,6 +97,10 @@ def enrich_chunks_with_document_metadata(
             doc_ids_by_kb.setdefault(kb_ids, set()).add(doc_id)
 
     if not doc_ids_by_kb:
+        return
+
+    if include_document_info:
+        _attach_full_document_info(chunks, doc_ids_by_kb, metadata_fields, doc_field, output_field)
         return
 
     # Resolve service lazily so callers/tests that swap service modules at runtime
@@ -120,3 +131,79 @@ def enrich_chunks_with_document_metadata(
         if meta:
             chunk[output_field] = meta
             logging.debug("Enriched chunk for doc_id=%s with %d metadata fields: %s", doc_id, len(meta), list(meta.keys()))
+
+
+def _attach_full_document_info(
+    chunks: list[dict],
+    doc_ids_by_kb: dict[str, set[str]],
+    metadata_fields: set[str] | None,
+    doc_field: str,
+    output_field: str,
+) -> None:
+    """Attach the full document record + custom metadata for each returned doc.
+
+    The doc records are fetched once per knowledge base via the same batch
+    ``doc_ids`` path the REST documents endpoint uses, so only the documents
+    referenced by this result page are touched. Any DB failure only disables
+    the enrichment (fail-open); retrieval is never blocked by it.
+    """
+    try:
+        from api.db.services.document_service import DocumentService
+
+        doc_getter = getattr(DocumentService, "get_by_kb_id", None)
+        if not callable(doc_getter):
+            logger.warning("DocumentService.get_by_kb_id is unavailable; skipping document info enrichment.")
+            return
+
+        full_by_doc: dict[str, dict] = {}
+        for kb_id, doc_ids in doc_ids_by_kb.items():
+            docs_list, _ = doc_getter(
+                kb_id,
+                1,
+                len(doc_ids),
+                "create_time",
+                True,
+                None,
+                None,
+                None,
+                None,
+                doc_ids=list(doc_ids),
+            )
+            for doc in docs_list or []:
+                if not isinstance(doc, dict):
+                    continue
+                doc_id = doc.get("id")
+                if not doc_id:
+                    continue
+                meta_fields = doc.get("meta_fields") or {}
+                if metadata_fields is not None:
+                    meta_fields = {k: v for k, v in meta_fields.items() if k in metadata_fields}
+                full_by_doc[doc_id] = {
+                    "document_id": doc_id,
+                    "name": doc.get("name", ""),
+                    "location": doc.get("location", ""),
+                    "type": doc.get("type", ""),
+                    "size": doc.get("size"),
+                    "chunk_count": doc.get("chunk_count", doc.get("chunk_num")),
+                    "create_date": doc.get("create_date", ""),
+                    "update_date": doc.get("update_date", ""),
+                    "token_count": doc.get("token_count", doc.get("token_num")),
+                    "thumbnail": doc.get("thumbnail", ""),
+                    "dataset_id": doc.get("dataset_id", kb_id),
+                    "meta_fields": meta_fields,
+                }
+            logger.debug("Fetched document info for %d docs in kb_id=%s", len(full_by_doc), kb_id)
+
+        if not full_by_doc:
+            return
+
+        for chunk in chunks:
+            doc_id = chunk.get(doc_field)
+            if not doc_id:
+                continue
+            meta = full_by_doc.get(doc_id)
+            if meta:
+                chunk[output_field] = meta
+                logger.debug("Enriched chunk for doc_id=%s with full document record", doc_id)
+    except Exception:
+        logger.exception("Failed to build full document metadata; skipping document info enrichment.")
